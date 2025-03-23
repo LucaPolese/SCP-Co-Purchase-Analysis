@@ -1,6 +1,7 @@
-.idea/
+.idea
 .bsp/
 target/
 project/
 data/
 output/
+.env

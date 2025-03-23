@@ -1,5 +1,3 @@
-package it.lucapolese.unibo
-
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.rdd.RDD
 import org.apache.spark.HashPartitioner
@@ -9,76 +7,74 @@ object CoPurchaseAnalysis {
     // Start timing the execution
     val startTime = System.currentTimeMillis()
 
+    // Get GCP bucket from command line arguments
+    val gcpBucket = if (args.length > 0) args(0)
+    else throw new IllegalArgumentException("GCP_BUCKET must be provided as a command line argument")
+
     // Initialize Spark Session
     val spark = SparkSession.builder()
       .appName("Co-Purchase Analysis")
-      .config("spark.executor.cores", "8") // Number of cores per executor
-      .config("spark.executor.instances", "2") // Number of executor instances
+      .config("spark.executor.cores", "4")
+      .config("spark.driver.memory", "6g")
+      .config("spark.executor.memory", "4g")
       .getOrCreate()
-
-    // Read dataset from CSV file
-    val inputPath = "data/order_products.csv"
-    val outputPath = "output/co_purchase_results"
-    val rawData: RDD[String] = spark.sparkContext.textFile(inputPath)
 
     // Determine number of partitions based on dataset size
     val cores = spark.conf.get("spark.executor.cores").toInt
     val instances = spark.conf.get("spark.executor.instances").toInt
-    val numPartitions = cores * instances * 3
+    val numPartitions = cores * instances * 3  // Slightly more partitions for better parallelism
 
-    println(s"numPartitions = ${numPartitions}")
+    try {
+      // Read dataset from CSV file using environment variable
+      val inputPath = s"gs://$gcpBucket/order_products.csv"
+      val outputPath = s"gs://$gcpBucket/output/$instances/co_purchase_results/"
 
-    // Parse dataset (order_id, product_id)
-    val orderProductPairs: RDD[(Int, Int)] = rawData.map(line => {
-      val cols = line.split(",")
-      (cols(0).toInt, cols(1).toInt)
-    }).partitionBy(new HashPartitioner(numPartitions))
+      // Read with more partitions for better parallelism
+      val rawData: RDD[String] = spark.sparkContext.textFile(inputPath, numPartitions)
 
-    // Group by order_id to get products in each order
-    val orderToProducts: RDD[(Int, Iterable[Int])] = orderProductPairs.groupByKey()
+      // Parse dataset (order_id, product_id)
+      val orderProductPairs: RDD[(Int, Int)] = rawData
+        .map(line => {
+          val cols = line.split(",")
+          (cols(0).toInt, cols(1).toInt)
+        })
+        .partitionBy(new HashPartitioner(numPartitions))
 
-    // Generate co-purchase pairs (unordered unique pairs per order)
-    val coPurchasePairs: RDD[((Int, Int), Int)] = orderToProducts
-      .flatMap { case (_, products) =>
+      // Group by order_id to get products in each order
+      val orderToProducts: RDD[(Int, Iterable[Int])] = orderProductPairs.groupByKey()
+
+      // Generate co-purchase pairs with better memory management
+      val coPurchasePairs: RDD[((Int, Int), Int)] = orderToProducts.flatMap { case (_, products) =>
         val productList = products.toList
-        productList.combinations(2).map { combination =>
-          // Ensure products are sorted to create consistent pairs
-          val sortedPair = if (combination.head <= combination(1))
-            (combination.head, combination(1))
-          else
-            (combination(1), combination.head)
-          (sortedPair, 1)
-        }
+        for {
+          i <- productList.indices
+          j <- (i + 1) until productList.size
+        } yield ((productList(i), productList(j)), 1)
       }
 
-    // Reduce by key to count occurrences of each co-purchase pair
-    val coPurchaseCounts: RDD[((Int, Int), Int)] = coPurchasePairs
-      // Even distribution of keys across partitions before the reduce operation
-      .partitionBy(new HashPartitioner(numPartitions))
-      .reduceByKey(_ + _)
+      // Reduce by key to count occurrences of each co-purchase pair
+      val coPurchaseCounts: RDD[((Int, Int), Int)] = coPurchasePairs
+        .partitionBy(new HashPartitioner(numPartitions))
+        .reduceByKey(_ + _)
 
-    // Transform the RDD[((Int, Int), Int)] to RDD[String] before saving
-    val resultRDD: RDD[String] = coPurchaseCounts.map {
-      case ((p1, p2), count) => s"$p1,$p2,$count"
+      // All results to partitioned files
+      coPurchaseCounts.map{
+        case ((p1, p2), count) => s"$p1,$p2,$count"
+      }.saveAsTextFile(outputPath)
+
+      // Calculate and log execution time
+      val endTime = System.currentTimeMillis()
+      val executionTimeInSeconds = (endTime - startTime) / 1000.0
+      // Log execution details
+      println(s"Number of partitions: $numPartitions")
+      println(s"Total execution time: $executionTimeInSeconds seconds")
+    } catch {
+      case e: Exception =>
+        println(s"Error in co-purchase analysis: ${e.getMessage}")
+        e.printStackTrace()
+    } finally {
+      // Stop Spark Session
+      spark.stop()
     }
-
-    // Create a header
-    val header = spark.sparkContext.parallelize(Seq("product1,product2,count"))
-
-    // Save results - use coalesce(1) to write to a single file without sorting
-    // Combine header with data
-    header.union(resultRDD).coalesce(1).saveAsTextFile(outputPath)
-
-    // Log execution details
-    println(s"Number of partitions: $numPartitions")
-    println(s"Total records processed: ${rawData.count()}")
-
-    // Calculate and log execution time
-    val endTime = System.currentTimeMillis()
-    val executionTimeInSeconds = (endTime - startTime) / 1000.0
-    println(s"Total execution time: $executionTimeInSeconds seconds")
-
-    // Stop Spark Session
-    spark.stop()
   }
 }
