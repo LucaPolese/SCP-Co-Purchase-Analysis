@@ -33,6 +33,33 @@ update_executor_instances() {
   echo "Updated Spark executor instances to $instances"
 }
 
+# Update Spark memory configuration in Scala file
+update_memory_config() {
+  local is_single_node=$1
+
+  if [ "$is_single_node" = true ]; then
+    # Set memory config for single node
+    sed -i "s/\.config(\"spark\.driver\.memory\", \"[0-9]\+g\")/\.config(\"spark\.driver\.memory\", \"6g\")/" src/main/scala/CoPurchaseAnalysis.scala
+    sed -i "s/\.config(\"spark\.executor\.memory\", \"[0-9]\+g\")/\.config(\"spark\.executor\.memory\", \"4g\")/" src/main/scala/CoPurchaseAnalysis.scala
+    echo "Updated Spark memory configuration for single node (driver: 6g, executor: 4g)"
+  else
+    # Set memory config for multi-node
+    sed -i "s/\.config(\"spark\.driver\.memory\", \"[0-9]\+g\")/\.config(\"spark\.driver\.memory\", \"4g\")/" src/main/scala/CoPurchaseAnalysis.scala
+    sed -i "s/\.config(\"spark\.executor\.memory\", \"[0-9]\+g\")/\.config(\"spark\.executor\.memory\", \"4g\")/" src/main/scala/CoPurchaseAnalysis.scala
+    echo "Updated Spark memory configuration for multi-node (driver: 4g, executor: 4g)"
+  fi
+}
+
+# Clean output directory in GCP bucket
+clean_output_directory() {
+  echo "Cleaning output directory in GCP bucket..."
+
+  # Attempt to delete without checking first - the -f flag will suppress errors
+  gsutil -m rm -rf gs://$GCP_BUCKET/output/ 2>/dev/null || true
+
+  echo "Output directory cleaned"
+}
+
 # Build and upload JAR to GCP bucket
 build_and_upload() {
   local version=$1
@@ -61,18 +88,30 @@ build_and_upload() {
 run_spark_job() {
   local version=$1
   local executor_instances=$2
+  local is_single_node=$3
   local scala_version=$(grep "scalaVersion :=" build.sbt | cut -d'"' -f2 | cut -d'.' -f1,2)
   local jar_file="co-purchase-analysis_$scala_version-$version.jar"
+  local driver_memory=""
+  local executor_memory=""
+
+  if [ "$is_single_node" = true ]; then
+    driver_memory="6g"
+    executor_memory="4g"
+  else
+    driver_memory="4g"
+    executor_memory="4g"
+  fi
 
   echo "Running Spark job on GCP cluster $CLUSTER_NAME"
   echo "Using JAR file: $jar_file with $executor_instances executor instances"
+  echo "Memory configuration: driver=$driver_memory, executor=$executor_memory"
 
   gcloud dataproc jobs submit spark \
     --cluster=$CLUSTER_NAME \
     --region=$REGION \
     --class=CoPurchaseAnalysis \
     --jars="gs://$GCP_BUCKET/$jar_file" \
-    --properties="spark.executor.instances=$executor_instances" \
+    --properties="spark.executor.instances=$executor_instances,spark.driver.memory=$driver_memory,spark.executor.memory=$executor_memory" \
     -- $GCP_BUCKET   # Passing the bucket name as a command-line argument
 
   echo "Spark job completed"
@@ -89,7 +128,7 @@ create_single_node_cluster() {
     --single-node \
     --master-machine-type n2-standard-4 \
     --master-boot-disk-type pd-balanced \
-    --master-boot-disk-size 100 \
+    --master-boot-disk-size 240 \
     --image-version $IMAGE_VERSION \
     --project $GCP_BUCKET
 
@@ -184,19 +223,20 @@ check_environment() {
   echo "Environment check complete."
 }
 
-# Drop all running Dataproc clusters
+# Drop all running Dataproc clusters in the specified region
 drop_all_clusters() {
-  echo "Checking for running Dataproc clusters..."
+  echo "Checking for running Dataproc clusters in region $REGION..."
 
-  # List all clusters and extract their names and regions
-  local clusters=$(gcloud dataproc clusters list --project $GCP_BUCKET --region $REGION --format="csv[no-heading](name)")
+  # List all clusters and extract only their names (skip the header line)
+  local clusters=$(gcloud dataproc clusters list --project $GCP_BUCKET --region $REGION --format="get(NAME)")
 
   if [ -z "$clusters" ]; then
-    echo "No running Dataproc clusters found."
+    echo "No running Dataproc clusters found in region $REGION."
     return 0
   fi
 
-  echo "Found the following Dataproc clusters:"
+  echo "Found the following Dataproc clusters in region $REGION:"
+  echo "$clusters"
 
   # Loop through each cluster and delete it
   for cluster_name in $clusters; do
@@ -210,7 +250,7 @@ drop_all_clusters() {
     echo "Cluster $cluster_name deleted successfully"
   done
 
-  echo "All Dataproc clusters have been deleted"
+  echo "All Dataproc clusters in region $REGION have been deleted"
 }
 
 # Run single node test
@@ -220,12 +260,15 @@ run_single_node_test() {
   # Create single-node cluster
   create_single_node_cluster
 
+  # Update Spark configuration for single node
+  update_memory_config true
+
   # Build and upload
   local version=$(get_and_increment_version)
   build_and_upload $version
 
   # Run job with 1 executor
-  run_spark_job $version 1
+  run_spark_job $version 1 true
 
   # Delete cluster
   delete_cluster
@@ -239,6 +282,9 @@ run_scaling_tests() {
 
   # Define worker counts to test
   local worker_counts=(2 3 4)
+
+  # Update Spark configuration for multi-node
+  update_memory_config false
 
   # Initial cluster with first worker count
   create_multi_node_cluster ${worker_counts[0]}
@@ -257,7 +303,7 @@ run_scaling_tests() {
     build_and_upload $version
 
     # Run job with current worker count
-    run_spark_job $version $worker_count
+    run_spark_job $version $worker_count false
   done
 
   # Delete cluster
@@ -273,8 +319,11 @@ main() {
   # Check environment
   check_environment
 
-  # First, drop any running clusters
+  # First, drop any running clusters in the region
   drop_all_clusters
+
+  # Clean output directory in GCP bucket
+  clean_output_directory
 
   # Run single node test
   run_single_node_test
