@@ -11,8 +11,8 @@ object CoPurchaseAnalysis {
     val spark = SparkSession.builder()
       .appName("Co-Purchase Analysis")
       .config("spark.executor.cores", "3")
-      //.config("spark.speculation", "true")  // Handle stragglers
-      //.config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")  // Better serialization
+      .config("spark.speculation", "true")  // Handle stragglers
+      .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")  // Better serialization
       .getOrCreate()
 
     // Get GCP bucket from command line arguments
@@ -39,7 +39,7 @@ object CoPurchaseAnalysis {
           (cols(0).toInt, cols(1).toInt)
         })
         .partitionBy(new HashPartitioner(numPartitions))
-        //.cache()
+        .cache()
 
       // Group by order_id to get products in each order
       val orderToProducts: RDD[(Int, Iterable[Int])] = orderProductPairs.groupByKey()
